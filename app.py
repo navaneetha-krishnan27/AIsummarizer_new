@@ -159,6 +159,40 @@ def is_maintenance_active():
         return True
     return False
 
+# --- CONTEXT PROCESSOR ---
+@app.context_processor
+def inject_global_vars():
+    # Pass Rating Setting
+    r_setting = SiteSetting.query.filter_by(key_name='enable_ratings').first()
+    rating_enabled = True if r_setting and r_setting.value == 'true' else False
+    
+    # Check if the specific user has ALREADY rated in the CURRENT session
+    user_has_rated = False
+    if current_user.is_authenticated:
+        # Get the time when the admin last enabled ratings
+        start_setting = SiteSetting.query.filter_by(key_name='rating_start_time').first()
+        start_time = datetime.min # Default to very old if not set
+        
+        if start_setting and start_setting.value:
+            try:
+                start_time = datetime.fromisoformat(start_setting.value)
+            except ValueError:
+                pass
+        
+        # Check if user has a rating AFTER that start time
+        if Rating.query.filter(Rating.user_id == current_user.id, Rating.timestamp >= start_time).first():
+            user_has_rated = True
+
+    # Pass Latest Announcement
+    announcement = Notification.query.order_by(Notification.created_at.desc()).first()
+    active_announcement = announcement.message if announcement else None
+
+    return dict(
+        rating_enabled=rating_enabled, 
+        active_announcement=active_announcement,
+        user_has_rated=user_has_rated
+    )
+
 # --- UTILITY FUNCTIONS ---
 
 def clean_text(text):
@@ -542,12 +576,33 @@ def admin_users():
 @app.route('/admin/settings', methods=['POST'])
 @admin_required
 def admin_settings():
+    # Handle Maintenance Mode
     m_mode = 'true' if request.form.get('maintenance_mode') else 'false'
-    s = SiteSetting.query.filter_by(key_name='maintenance_mode').first()
-    if not s: s = SiteSetting(key_name='maintenance_mode'); db.session.add(s)
-    s.value = m_mode
+    s_maint = SiteSetting.query.filter_by(key_name='maintenance_mode').first()
+    if not s_maint: s_maint = SiteSetting(key_name='maintenance_mode'); db.session.add(s_maint)
+    s_maint.value = m_mode
+    
+    # Handle Ratings Toggle
+    r_mode = 'true' if request.form.get('enable_ratings') else 'false'
+    s_rate = SiteSetting.query.filter_by(key_name='enable_ratings').first()
+    if not s_rate: 
+        s_rate = SiteSetting(key_name='enable_ratings', value='false')
+        db.session.add(s_rate)
+    
+    # NEW LOGIC: If enabling (transition from False -> True), reset the session timer
+    if r_mode == 'true' and s_rate.value != 'true':
+        s_time = SiteSetting.query.filter_by(key_name='rating_start_time').first()
+        if not s_time:
+            s_time = SiteSetting(key_name='rating_start_time')
+            db.session.add(s_time)
+        s_time.value = datetime.utcnow().isoformat()
+
+    s_rate.value = r_mode
+
+    # Handle Announcement
     ann = request.form.get('announcement')
     if ann: db.session.add(Notification(message=ann))
+    
     db.session.commit(); flash("Settings updated."); return redirect(url_for('admin_dashboard'))
 
 # --- CORE USER ROUTES ---
@@ -729,10 +784,25 @@ def delete_bulk():
         db.session.commit()
     return jsonify({'status': 'success'})
 
+@app.route('/submit_rating_api', methods=['POST'])
+@login_required
+def submit_rating_api():
+    data = request.json
+    stars = int(data.get('rating', 0))
+    if 1 <= stars <= 5:
+        new_rating = Rating(user_id=current_user.id, stars=stars)
+        db.session.add(new_rating)
+        db.session.commit()
+        return jsonify({'status': 'success'})
+    return jsonify({'status': 'error'}), 400
+
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
+        # Initialize default settings if missing
         if not SiteSetting.query.filter_by(key_name='maintenance_mode').first():
             db.session.add(SiteSetting(key_name='maintenance_mode', value='false'))
-            db.session.commit()
+        if not SiteSetting.query.filter_by(key_name='enable_ratings').first():
+            db.session.add(SiteSetting(key_name='enable_ratings', value='false'))
+        db.session.commit()
     app.run(debug=True)
